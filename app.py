@@ -478,27 +478,35 @@ birth_options = {
     birth_cohort_label(1980, 1984): (1980, 1984),
     birth_cohort_label(1975, 1979): (1975, 1979),
     birth_cohort_label(1970, 1974): (1970, 1974)}
+
+# --- 追加が必要なコード ---
+# 1. 生年区分の選択
+birth_selected_label = st.sidebar.selectbox("② 生年区分", list(birth_options.keys()))
+birth_start, birth_end = birth_options[birth_selected_label]
+
+# 2. 年代カテゴリの自動計算
+age_category = derived_age_category(birth_start, birth_end)
+
+# 3. その他の属性（これらも st.write で使っているため定義が必要です）
+employment = st.sidebar.selectbox("③ 雇用形態", ["正規", "非正規", "無業者", "休職中"])
+family = st.sidebar.selectbox("④ 家族構成", ["単身", "親と同居", "配偶者あり", "子供あり（ひとり親）", "子供あり（ふたり親）"])
+education = st.sidebar.selectbox("⑤ 最終学歴", ["大学・大学院卒", "短大・専門卒", "高校卒", "その他"])
+health_constraint = st.sidebar.selectbox("⑥ 健康制約", ["特になし", "持病あり", "メンタルヘルス上の課題", "その他"])
+care_responsibility = st.sidebar.selectbox("⑦ ケア責任", ["なし", "育児中", "介護中", "育児・介護両方"])
+housing = st.sidebar.selectbox("⑧ 住居状況", ["持ち家", "賃貸", "実家", "不安定な住居"])
+digital_access = st.sidebar.selectbox("⑨ デジタル利用環境", ["良好", "普通", "限定的（スマホのみなど）", "困難"])
+support_network = st.sidebar.selectbox("⑩ 相談先", ["あり", "限定的", "なし"])
+
+# 物語生成に使う追加条件（マルチセレクトなど）
+support_methods = st.sidebar.multiselect("支援方法", ["給付金", "伴走支援", "リスキリング", "就職斡旋"])
+support_period = st.sidebar.selectbox("支援期間", ["短期", "中長期"])
+policy_goal = st.sidebar.text_input("政策目標", "自立支援")
+constraints = st.sidebar.multiselect("当事者の制約", ["時間の制約", "移動の制約", "心理的障壁"])
+# ------------------------
+
 # 現在設定の表示
 # =========================
 st.subheader("現在の設定")
-col1, col2 = st.columns(2)
-
-with col1:
-    st.write(f"**性別**: {gender}")
-    st.write(f"**生年区分**: {birth_selected_label}")
-    st.write(f"**年代カテゴリ**: {age_category}")
-    st.write(f"**雇用形態**: {employment}")
-    st.write(f"**家族構成**: {family}")
-
-with col2:
-    st.write(f"**最終学歴**: {education}")
-    st.write(f"**健康/就労制約**: {health_constraint}")
-    st.write(f"**ケア責任**: {care_responsibility}")
-    st.write(f"**住居状況**: {housing}")
-    st.write(f"**デジタル利用環境**: {digital_access}")
-    st.write(f"**相談先**: {support_network}")
-
-st.markdown("---")
 
 
 # =========================
