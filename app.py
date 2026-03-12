@@ -7,6 +7,7 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
+
 # =========================
 # 基本設定
 # =========================
@@ -15,35 +16,36 @@ st.title("📖 ナラティブ・ポリシー・アドバイザー")
 st.caption("東京都オープンデータを根拠として、対象者像・物語・ニーズ・政策仮説を生成します。")
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
 CURRENT_YEAR = datetime.now().year
+
+# 東京都オープンデータ CKAN API
+CKAN_API = "https://catalog.data.metro.tokyo.lg.jp/api/3/action/package_search"
+
 
 # =========================
 # ユーティリティ
 # =========================
 def safe_json_load(text: str) -> dict:
-    """LLMの返答からJSONを安全に抽出"""
+    """LLM返答からJSONだけを安全に取り出す"""
     try:
         return json.loads(text)
     except Exception:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             return json.loads(match.group(0))
-        raise ValueError("JSONの解析に失敗しました。")
+        raise ValueError("JSONの解析に失敗しました。返答形式を確認してください。")
+
 
 def birth_cohort_label(start_year: int, end_year: int) -> str:
-    mid_age_from = CURRENT_YEAR - end_year
-    mid_age_to = CURRENT_YEAR - start_year
-    return f"{start_year}〜{end_year}年生（{mid_age_from}〜{mid_age_to}歳相当）"
+    age_low = CURRENT_YEAR - end_year
+    age_high = CURRENT_YEAR - start_year
+    return f"{start_year}〜{end_year}年生（{age_low}〜{age_high}歳相当）"
+
 
 def derived_age_category(start_year: int, end_year: int) -> str:
-    """
-    表示用カテゴリ。
-    5年刻みの生年を元に、物語説明上のカテゴリも付ける。
-    """
-    age_from = CURRENT_YEAR - end_year
-    age_to = CURRENT_YEAR - start_year
-    mid = (age_from + age_to) / 2
+    age_low = CURRENT_YEAR - end_year
+    age_high = CURRENT_YEAR - start_year
+    mid = (age_low + age_high) / 2
 
     if 40 <= mid < 45:
         return "40代前半"
@@ -51,191 +53,155 @@ def derived_age_category(start_year: int, end_year: int) -> str:
         return "40代後半"
     elif 50 <= mid < 55:
         return "50代前半"
-    else:
-        return "就職氷河期世代"
+    return "就職氷河期世代"
+
 
 def to_official_age_band(start_year: int, end_year: int) -> str:
     """
-    東京都労働力統計の10歳階級に寄せるための近似。
+    東京都労働力統計の年齢階級に近似させる
     """
-    age_from = CURRENT_YEAR - end_year
-    age_to = CURRENT_YEAR - start_year
-    mid = (age_from + age_to) / 2
+    age_low = CURRENT_YEAR - end_year
+    age_high = CURRENT_YEAR - start_year
+    mid = (age_low + age_high) / 2
 
     if mid < 45:
         return "35～44歳"
     elif mid < 55:
         return "45～54歳"
-    else:
-        return "55～64歳"
+    return "55～64歳"
+
 
 def first_text_column(df: pd.DataFrame) -> str:
-    for c in df.columns:
-        if df[c].dtype == object:
-            return c
+    for col in df.columns:
+        if df[col].dtype == object:
+            return col
     return df.columns[0]
+
 
 def normalize_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    for c in out.columns:
-        if out[c].dtype == object:
-            out[c] = out[c].astype(str).str.replace(",", "", regex=False)
-            out[c] = pd.to_numeric(out[c], errors="ignore")
+    for col in out.columns:
+        if out[col].dtype == object:
+            out[col] = out[col].astype(str).str.replace(",", "", regex=False)
+            out[col] = pd.to_numeric(out[col], errors="ignore")
     return out
+
 
 def load_csv_flexible(url: str) -> pd.DataFrame:
     """
-    東京都のCSVは文字コードや構造が揺れるため、複数パターンで読む。
+    東京都のCSVは文字コードゆれがあるため複数候補で読む
     """
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
+    response = requests.get(url, timeout=20)
+    response.raise_for_status()
 
     encodings = ["utf-8-sig", "cp932", "shift_jis", "utf-8"]
-    last_err = None
+    last_error = None
+
     for enc in encodings:
         try:
-            return pd.read_csv(pd.io.common.BytesIO(r.content), encoding=enc)
+            return pd.read_csv(pd.io.common.BytesIO(response.content), encoding=enc)
         except Exception as e:
-            last_err = e
+            last_error = e
 
-    raise last_err
+    raise last_error
+
+
+def format_thousand_persons(value):
+    try:
+        return f"{float(value):.1f}千人"
+    except Exception:
+        return "不明"
+
 
 # =========================
-# 東京都オープンデータ カタログ / API
+# 東京都オープンデータ検索
 # =========================
-CKAN_API = "https://catalog.data.metro.tokyo.lg.jp/api/3/action/package_search"
-
 @st.cache_data(ttl=60 * 60 * 12)
 def search_tokyo_catalog(query: str, rows: int = 10):
     params = {"q": query, "rows": rows}
-    r = requests.get(CKAN_API, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    response = requests.get(CKAN_API, params=params, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
     if not data.get("success"):
         return []
+
     return data["result"]["results"]
+
 
 @st.cache_data(ttl=60 * 60 * 12)
 def get_dataset_resources_by_title_keyword(title_keyword: str):
-    """
-    タイトルにキーワードを含むデータセットを検索し、最初の候補を返す
-    """
     results = search_tokyo_catalog(title_keyword, rows=10)
+    if not results:
+        return None
+
     for ds in results:
-        if title_keyword.replace(" ", "")[:4] in ds.get("title", "").replace(" ", ""):
+        title = (ds.get("title") or "").replace(" ", "")
+        if title_keyword.replace(" ", "")[:4] in title:
             return ds
-    return results[0] if results else None
+    return results[0]
+
 
 def get_resource_url(dataset: dict, resource_name_keyword: str):
     if not dataset:
-        return None
+        return None, None
+
     for res in dataset.get("resources", []):
-        name = (res.get("name") or "")
+        name = res.get("name") or ""
         if resource_name_keyword in name:
             return res.get("url"), name
+
     return None, None
 
-# =========================
-# 参照する東京都オープンデータ
-# =========================
-def build_reference_catalog():
-    return [
-        {
-            "name": "東京の労働力 統計データ（令和4年平均）",
-            "url": "https://catalog.data.metro.tokyo.lg.jp/ja/dataset/t000003d0000000591",
-            "data_tags": ["人口分布", "就業状態", "年齢階級", "雇用形態"],
-            "issue_tags": ["就労", "無業", "非正規", "再就職"],
-            "why": "年代別の就業状態、雇用形態、完全失業などの把握に利用"
-        },
-        {
-            "name": "東京の労働力 統計データ（令和3年平均）",
-            "url": "https://catalog.data.metro.tokyo.lg.jp/dataset/t000003d0000000400",
-            "data_tags": ["人口分布", "就業状態", "男女別", "雇用形態"],
-            "issue_tags": ["就労", "失業", "非正規", "労働市場"],
-            "why": "男女別・年齢階級別の就業状態の補助参照"
-        },
-        {
-            "name": "東京都世帯数の予測 第5-1表 区市町村別ひとり親と子供の世帯数",
-            "url": "https://catalog.data.metro.tokyo.lg.jp/dataset/t000003d0000000035",
-            "data_tags": ["世帯構成", "ひとり親", "地域別"],
-            "issue_tags": ["子育て", "世帯支援", "家計", "住居"],
-            "why": "家族構成、とくにひとり親に関する政策文脈の参照"
-        },
-        {
-            "name": "【行政資料集】子育て（ひとり親家庭等医療費助成制度受給世帯数を含む）",
-            "url": "https://catalog.data.metro.tokyo.lg.jp/dataset/t131032d0000000039",
-            "data_tags": ["ひとり親", "受給世帯数", "子育て支援"],
-            "issue_tags": ["福祉", "家計", "医療費", "養育"],
-            "why": "ひとり親関連の支援規模感の補助参照"
-        },
-        {
-            "name": "東京都男女年齢（5歳階級）別人口の予測",
-            "url": "https://www.toukei.metro.tokyo.lg.jp/dyosoku/dy-index.htm",
-            "data_tags": ["人口", "男女別", "5歳階級", "将来推計"],
-            "issue_tags": ["人口構成", "対象母数"],
-            "why": "生年5年区分に近い人口構成を説明する基礎参照"
-        },
-    ]
 
 # =========================
-# 人口分布・規模感の簡易推計
+# 参照データ定義
+# 規模感推計
 # =========================
 @st.cache_data(ttl=60 * 60 * 12)
 def get_labor_force_dataset():
-    """
-    令和4年平均を優先し、なければ令和3年平均を返す
-    """
     ds = get_dataset_resources_by_title_keyword("東京の労働力 統計データ（令和4年平均）")
     if ds:
         return ds
     return get_dataset_resources_by_title_keyword("東京の労働力 統計データ（令和3年平均）")
 
-def detect_age_column(df: pd.DataFrame, official_age_band: str):
-    """
-    例: 実数／45～54歳（千人、％）
-    """
-    candidates = []
-    for c in df.columns:
-        s = str(c)
-        if official_age_band in s and "実数" in s:
-            candidates.append(c)
 
-    # 雇用形態別表などは別表記の可能性もある
+def detect_age_column(df: pd.DataFrame, official_age_band: str):
+    candidates = []
+    for col in df.columns:
+        s = str(col)
+        if official_age_band in s and "実数" in s:
+            candidates.append(col)
+
     if not candidates:
-        for c in df.columns:
-            if official_age_band in str(c):
-                candidates.append(c)
+        for col in df.columns:
+            if official_age_band in str(col):
+                candidates.append(col)
 
     return candidates[0] if candidates else None
 
+
 def detect_row(df: pd.DataFrame, keywords):
     text_col = first_text_column(df)
-    mask = df[text_col].astype(str)
+    series = df[text_col].astype(str)
     for kw in keywords:
-        hit = df[mask.str.contains(kw, na=False)]
+        hit = df[series.str.contains(kw, na=False)]
         if not hit.empty:
             return hit.iloc[0]
     return None
 
-def format_thousand_persons(value):
-    try:
-        v = float(value)
-        return f"{v:.1f}千人"
-    except Exception:
-        return "不明"
 
-def estimate_scale(selected_gender: str, birth_start: int, birth_end: int, emp: str):
-    """
-    東京都の労働力統計から、年齢階級近似ベースの規模感を出す。
-    厳密な対象者数ではなく、政策検討上の参考規模。
-    """
+def estimate_scale(selected_gender: str, birth_start: int, birth_end: int, employment: str):
     ds = get_labor_force_dataset()
     if not ds:
-        return {"summary": "東京都オープンデータから規模感を取得できませんでした。", "details": [], "source_links": []}
+        return {
+            "summary": "東京都オープンデータから規模感を取得できませんでした。",
+            "details": [],
+            "source_links": []
+        }
 
     official_age_band = to_official_age_band(birth_start, birth_end)
 
-    # 男女別の第3表候補
     if selected_gender == "男性":
         age_table_kw = "第３表 年齢階級別就業状態（男）"
     elif selected_gender == "女性":
@@ -253,10 +219,12 @@ def estimate_scale(selected_gender: str, birth_start: int, birth_end: int, emp: 
         if age_url:
             df_age = normalize_numeric_columns(load_csv_flexible(age_url))
             age_col = detect_age_column(df_age, official_age_band)
+
             if age_col:
+                labor_force = detect_row(df_age, ["労働力人口"])
                 employed = detect_row(df_age, ["就業者", "有業者"])
                 unemployed = detect_row(df_age, ["完全失業者", "失業者"])
-                labor_force = detect_row(df_age, ["労働力人口"])
+                non_labor = detect_row(df_age, ["非労働力人口"])
 
                 if labor_force is not None:
                     details.append({
@@ -273,54 +241,75 @@ def estimate_scale(selected_gender: str, birth_start: int, birth_end: int, emp: 
                         "label": f"{official_age_band}の完全失業者",
                         "value": format_thousand_persons(unemployed.get(age_col))
                     })
+                if non_labor is not None:
+                    details.append({
+                        "label": f"{official_age_band}の非労働力人口",
+                        "value": format_thousand_persons(non_labor.get(age_col))
+                    })
 
-            source_links.append({"name": age_name or "年齢階級別就業状態", "url": age_url})
+            source_links.append({
+                "name": age_name or "年齢階級別就業状態",
+                "url": age_url
+            })
     except Exception:
         pass
 
     try:
-        if emp_url and emp in ["正規", "非正規"]:
+        if emp_url and employment in ["正規", "非正規"]:
             df_emp = normalize_numeric_columns(load_csv_flexible(emp_url))
             age_col = detect_age_column(df_emp, official_age_band)
+
             if age_col:
-                if emp == "正規":
+                if employment == "正規":
                     row = detect_row(df_emp, ["正規", "正規の職員", "正社員"])
                 else:
                     row = detect_row(df_emp, ["非正規", "パート", "アルバイト", "契約社員", "派遣"])
 
                 if row is not None:
                     details.append({
-                        "label": f"{official_age_band}の{emp}雇用者",
+                        "label": f"{official_age_band}の{employment}雇用者",
                         "value": format_thousand_persons(row.get(age_col))
                     })
 
-            source_links.append({"name": emp_name or "雇用形態別雇用者数", "url": emp_url})
+            source_links.append({
+                "name": emp_name or "雇用形態別雇用者数",
+                "url": emp_url
+            })
     except Exception:
         pass
 
-    if emp == "無業者":
+    if employment == "無業者":
         details.append({
             "label": "補足",
-            "value": "無業者は『就業者ではない層』として、年齢階級別就業状態の完全失業者・非労働力人口を参考に解釈してください。"
+            "value": "無業者は直接の単一統計値が乏しいため、完全失業者と非労働力人口を併せて政策検討用の参考規模として解釈します。"
         })
-    elif emp == "休職中":
+    elif employment == "休職中":
         details.append({
             "label": "補足",
-            "value": "休職中の直接統計は乏しいため、就業者数・雇用形態・療養/介護等の制約情報と併せて解釈します。"
+            "value": "休職中の直接統計は乏しいため、就業者数・雇用形態・健康制約を組み合わせて解釈します。"
         })
 
-    summary = f"東京都の公式オープンデータをもとに、{official_age_band}の近似階級で規模感を表示しています。生年5年区分と統計表の年齢階級が一致しないため、政策検討用の参考値です。"
+    summary = (
+        f"東京都の公式オープンデータをもとに、{official_age_band}の近似階級で規模感を表示しています。"
+        "生年5年区分と統計表の年齢階級は一致しないため、政策検討用の参考値です。"
+    )
 
-    return {"summary": summary, "details": details, "source_links": source_links}
+    return {
+        "summary": summary,
+        "details": details,
+        "source_links": source_links
+    }
+
 
 # =========================
-# 物語生成
+# LLMプロンプト
 # =========================
-def build_prompt(user_context, references):
+def build_structured_case_prompt(user_context, scale, references):
     return f"""
-あなたは東京都の就職氷河期世代支援を担当する政策アドバイザーです。
-以下の属性と前提条件、および東京都オープンデータの参照情報を踏まえて、
-JSONのみで出力してください。
+あなたは東京都の就職氷河期世代支援を担当する政策設計アナリストです。
+以下の属性、前提条件、東京都オープンデータの参照情報、規模感推計を踏まえて、
+「ありきたりな支援策の列挙」ではなく、
+当事者の詰まりポイントが具体的に見える構造化ケースをJSONで作成してください。
 
 【対象者属性】
 - 性別: {user_context['gender']}
@@ -335,50 +324,148 @@ JSONのみで出力してください。
 - デジタル利用環境: {user_context['digital_access']}
 - 相談先の有無: {user_context['support_network']}
 
-【追加の検討条件】
+【追加条件】
 - 支援方法: {", ".join(user_context['support_methods']) if user_context['support_methods'] else "指定なし"}
 - 支援期間: {user_context['support_period']}
 - 政策目標: {user_context['policy_goal']}
 - 当事者の制約: {", ".join(user_context['constraints']) if user_context['constraints'] else "指定なし"}
 
-【東京都オープンデータ参照情報】
+【規模感推計】
+{json.dumps(scale, ensure_ascii=False, indent=2)}
+
+【参照データ】
 {json.dumps(references, ensure_ascii=False, indent=2)}
 
-【出力条件】
-1. story: 300〜450文字程度の具体的な主人公の物語
-2. needs: 主人公の主要ニーズを3〜5個
-3. policy_hypotheses: 政策仮説を3〜5個
-4. issue_tags: 3〜7個
-5. data_tags: 3〜7個
-6. evidence_comment: 参照データをどう読んだかを120文字程度で簡潔に
-7. cautions: 推計や解釈上の注意点を2個以内
+【重要な指示】
+- 属性の言い換えは禁止
+- 「どんな日常上の詰まりがあるか」を具体化する
+- 支援策を先に書かず、まず詰まりポイントを特定する
+- 東京都オープンデータから読めること / 読めないことを分ける
+- 課題は心理、制度、家計、健康、家族責任、移動、情報アクセスなど複数軸で捉える
+- 陳腐な表現（不安を抱えている、悩んでいる、支援が必要、など）の多用は禁止
+- 生活場面が浮かぶ具体性を持たせる
 
-JSONスキーマ:
+以下のJSONのみを返してください:
+
 {{
-  "story": "...",
-  "needs": ["...", "..."],
-  "policy_hypotheses": ["...", "..."],
+  "data_observations": [
+    {{
+      "source": "参照データ名",
+      "insight": "データから読めること",
+      "implication": "人物像や課題設定にどう効くか"
+    }}
+  ],
+  "persona_core": {{
+    "current_state": "現在の生活状況を具体的に",
+    "pain_points": ["日常の詰まり1", "日常の詰まり2", "日常の詰まり3"],
+    "blocked_by": ["制度・環境・心理的な障壁1", "障壁2", "障壁3"],
+    "latent_needs": ["表面化していないニーズ1", "ニーズ2", "ニーズ3"]
+  }},
+  "story_seed": {{
+    "main_tension": "この人の核心的な葛藤",
+    "turning_point": "政策が介入すべき転機",
+    "why_this_case": "なぜ東京都の政策論点として意味があるか"
+  }},
   "issue_tags": ["...", "..."],
   "data_tags": ["...", "..."],
-  "evidence_comment": "...",
-  "cautions": ["...", "..."]
+  "evidence_trace": [
+    {{
+      "data_source": "参照データ名",
+      "used_for": "どの設定に使ったか"
+    }}
+  ],
+  "cautions": ["推定上の注意1", "推定上の注意2"]
 }}
 """.strip()
 
-def generate_story_and_hypotheses(user_context, references):
-    prompt = build_prompt(user_context, references)
-    response = client.chat.completions.create(
+
+def build_story_prompt(structured_case, user_context):
+    return f"""
+あなたは優れたノンフィクションライター兼政策分析者です。
+以下の構造化ケースをもとに、属性の説明ではなく、
+生活の手触りと政策上の論点が立ち上がる短い物語と政策仮説をJSONで返してください。
+
+【構造化ケース】
+{json.dumps(structured_case, ensure_ascii=False, indent=2)}
+
+【対象者属性】
+- 性別: {user_context['gender']}
+- 生年区分: {user_context['birth_label']}
+- 雇用形態: {user_context['employment']}
+- 家族構成: {user_context['family']}
+
+【指示】
+- 物語は300〜450文字
+- 属性の説明文にしない
+- 1日の場面、迷い、諦め、対人関係、制度との距離感などが見えるようにする
+- “かわいそう”に寄せず、現実の詰まりを描く
+- 政策仮説は一般論ではなく、ボトルネック仮説にする
+- 仮説ごとに「なぜそう考えるか」を付ける
+- 仮説は、窓口設計、支援順序、対象者抽出、制度連携、評価指標などの型を意識する
+
+以下のJSONのみを返してください:
+
+{{
+  "story": "...",
+  "needs": ["...", "...", "..."],
+  "policy_hypotheses": [
+    {{
+      "type": "窓口設計仮説",
+      "hypothesis": "...",
+      "why": "..."
+    }},
+    {{
+      "type": "支援順序仮説",
+      "hypothesis": "...",
+      "why": "..."
+    }},
+    {{
+      "type": "制度連携仮説",
+      "hypothesis": "...",
+      "why": "..."
+    }}
+  ]
+}}
+""".strip()
+
+
+def generate_case_and_story(user_context, references, scale):
+    # Step1: 構造化ケース
+    prompt1 = build_structured_case_prompt(user_context, scale, references)
+    resp1 = client.chat.completions.create(
         model="gpt-4o",
-        temperature=0.7,
+        temperature=0.8,
         messages=[
             {
                 "role": "system",
-                "content": "あなたは政策設計、福祉、就労支援、データ解釈に強いアシスタントです。必ずJSONのみを返してください。"
+                "content": "あなたは政策設計と社会課題の構造化に強いアシスタントです。必ずJSONのみを返してください。"
             },
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt1}
         ]
     )
-    return safe_json_load(response.choices[0].message.content)
+    structured_case = safe_json_load(resp1.choices[0].message.content)
+
+    # Step2: 物語・ニーズ・政策仮説
+    prompt2 = build_story_prompt(structured_case, user_context)
+    resp2 = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.9,
+        messages=[
+            {
+                "role": "system",
+                "content": "あなたは具体的な人物描写と政策仮説立案に強いアシスタントです。必ずJSONのみを返してください。"
+            },
+            {"role": "user", "content": prompt2}
+        ]
+    )
+    story_block = safe_json_load(resp2.choices[0].message.content)
+
+    merged = {
+        **structured_case,
+        **story_block
+    }
+    return merged
+
 
 # =========================
 # UI: サイドバー
@@ -388,75 +475,10 @@ st.sidebar.header("対象者の属性を選択")
 gender = st.sidebar.selectbox("① 性別", ["回答しない", "女性", "男性"])
 
 birth_options = {
-    birth_cohort_label(1980, 1984): (1980, 1984),  # 40代前半相当
-    birth_cohort_label(1975, 1979): (1975, 1979),  # 40代後半相当
-    birth_cohort_label(1970, 1974): (1970, 1974),  # 50代前半相当
-}
-birth_selected_label = st.sidebar.selectbox("② 生年（5年区分）", list(birth_options.keys()))
-birth_start, birth_end = birth_options[birth_selected_label]
-age_category = derived_age_category(birth_start, birth_end)
-
-employment = st.sidebar.selectbox("③ 雇用形態", ["正規", "非正規", "無業者", "休職中"])
-family = st.sidebar.selectbox("④ 家族構成", ["単身", "夫婦のみ", "夫婦と子", "ひとり親", "親と同居"])
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("⑤ 支援検討で把握したい追加属性")
-
-education = st.sidebar.selectbox(
-    "最終学歴",
-    ["指定なし", "中学・高校", "専門学校", "短大・高専", "大学", "大学院"]
-)
-
-health_constraint = st.sidebar.selectbox(
-    "健康/就労制約",
-    ["指定なし", "特になし", "メンタル不調", "身体疾患", "障害がある", "通院中", "療養中"]
-)
-
-care_responsibility = st.sidebar.selectbox(
-    "ケア責任",
-    ["指定なし", "なし", "子育てあり", "介護あり", "子育てと介護の両方"]
-)
-
-housing = st.sidebar.selectbox(
-    "住居状況",
-    ["指定なし", "持ち家", "民間賃貸", "公営住宅", "親族宅同居", "住居不安定"]
-)
-
-digital_access = st.sidebar.selectbox(
-    "デジタル利用環境",
-    ["指定なし", "スマホ中心", "PCあり", "ネット利用に不安", "ほとんど使わない"]
-)
-
-support_network = st.sidebar.selectbox(
-    "相談先の有無",
-    ["指定なし", "家族に相談できる", "友人に相談できる", "公的支援につながっている", "相談先がほぼない"]
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("前提条件を追加")
-
-support_methods = st.sidebar.multiselect(
-    "検討したい支援方法",
-    ["就労支援", "職業訓練", "療養支援", "リハビリ", "生活再建支援", "住居支援", "家計支援", "心理的支援", "伴走支援"]
-)
-
-support_period = st.sidebar.selectbox(
-    "支援期間",
-    ["短期（〜3か月）", "中期（3〜12か月）", "中長期（1〜3年）", "長期（3年以上）"]
-)
-
-policy_goal = st.sidebar.selectbox(
-    "政策目標",
-    ["再就職", "就業継続", "所得向上", "生活安定", "孤立防止", "医療・福祉との接続", "自己効力感の回復"]
-)
-
-constraints = st.sidebar.multiselect(
-    "当事者の制約",
-    ["体調不安", "育児負担", "介護負担", "ブランク長期化", "学び直し負担", "通勤困難", "対人不安", "家計逼迫", "デジタル弱者"]
-)
-
-# =========================
-# メイン表示
+    birth_cohort_label(1980, 1984): (1980, 1984),
+    birth_cohort_label(1975, 1979): (1975, 1979),
+    birth_cohort_label(1970, 1974): (1970, 1974),
+# 現在設定の表示
 # =========================
 st.subheader("現在の設定")
 col1, col2 = st.columns(2)
@@ -478,6 +500,10 @@ with col2:
 
 st.markdown("---")
 
+
+# =========================
+# 生成ボタン
+# =========================
 if st.button("物語を生成"):
     with st.spinner("東京都オープンデータを参照しながら生成中..."):
         try:
@@ -501,15 +527,63 @@ if st.button("物語を生成"):
                 "constraints": constraints,
             }
 
-            result = generate_story_and_hypotheses(user_context, references)
             scale = estimate_scale(gender, birth_start, birth_end, employment)
+            result = generate_case_and_story(user_context, references, scale)
 
+            # -------------------------
+            # 物語
+            # -------------------------
             st.subheader("生成された物語")
             st.write(result.get("story", ""))
 
-            c1, c2 = st.columns(2)
+            # -------------------------
+            # データから見た前提
+            # -------------------------
+            st.markdown("---")
+            st.markdown("### 東京都オープンデータから見た前提")
+            for obs in result.get("data_observations", []):
+                st.markdown(f"**出典**: {obs.get('source', '')}")
+                st.markdown(f"- 読み取れること: {obs.get('insight', '')}")
+                st.markdown(f"- 今回の人物設定への反映: {obs.get('implication', '')}")
 
-            with c1:
+            # -------------------------
+            # 主人公を置いた理由
+            # -------------------------
+            seed = result.get("story_seed", {})
+            if seed:
+                st.markdown("---")
+                st.markdown("### この主人公を置いた理由")
+                st.markdown(f"- **核心的な葛藤**: {seed.get('main_tension', '')}")
+                st.markdown(f"- **介入すべき転機**: {seed.get('turning_point', '')}")
+                st.markdown(f"- **政策論点としての意味**: {seed.get('why_this_case', '')}")
+
+            # -------------------------
+            # ペルソナの詰まり
+            # -------------------------
+            persona_core = result.get("persona_core", {})
+            if persona_core:
+                st.markdown("---")
+                st.markdown("### 構造化された人物像")
+                st.markdown(f"**現在の生活状況**: {persona_core.get('current_state', '')}")
+
+                st.markdown("**日常の詰まり**")
+                for item in persona_core.get("pain_points", []):
+                    st.markdown(f"- {item}")
+
+                st.markdown("**詰まりを強める障壁**")
+                for item in persona_core.get("blocked_by", []):
+                    st.markdown(f"- {item}")
+
+                st.markdown("**潜在ニーズ**")
+                for item in persona_core.get("latent_needs", []):
+                    st.markdown(f"- {item}")
+
+            # -------------------------
+            # ニーズと政策仮説
+            # -------------------------
+            col3, col4 = st.columns(2)
+
+            with col3:
                 st.markdown("### 主人公のニーズ")
                 for n in result.get("needs", []):
                     st.markdown(f"- {n}")
@@ -519,16 +593,21 @@ if st.button("物語を生成"):
                 if issue_tags:
                     st.caption(" / ".join([f"#{t}" for t in issue_tags]))
 
-            with c2:
+            with col4:
                 st.markdown("### 政策仮説")
                 for h in result.get("policy_hypotheses", []):
-                    st.markdown(f"- {h}")
+                    st.markdown(f"**{h.get('type', '仮説')}**")
+                    st.markdown(f"- 仮説: {h.get('hypothesis', '')}")
+                    st.markdown(f"- 根拠: {h.get('why', '')}")
 
                 st.markdown("### データタグ")
                 data_tags = result.get("data_tags", [])
                 if data_tags:
                     st.caption(" / ".join([f"#{t}" for t in data_tags]))
 
+            # -------------------------
+            # 規模感
+            # -------------------------
             st.markdown("---")
             st.markdown("### 人口分布・該当当事者の規模感（簡易推計）")
             st.info(scale.get("summary", ""))
@@ -539,16 +618,29 @@ if st.button("物語を生成"):
             else:
                 st.write("該当する規模感を自動推計できませんでした。参照リンクをご確認ください。")
 
-            st.markdown("---")
-            st.markdown("### 根拠データの読み方")
-            st.write(result.get("evidence_comment", ""))
+            # -------------------------
+            # どのデータをどこに使ったか
+            # -------------------------
+            trace = result.get("evidence_trace", [])
+            if trace:
+                st.markdown("---")
+                st.markdown("### どのデータをどこに使ったか")
+                for t in trace:
+                    st.markdown(f"- **{t.get('data_source', '')}** → {t.get('used_for', '')}")
 
+            # -------------------------
+            # 解釈上の注意
+            # -------------------------
             cautions = result.get("cautions", [])
             if cautions:
+                st.markdown("---")
                 st.markdown("### 解釈上の注意")
                 for c in cautions:
                     st.markdown(f"- {c}")
 
+            # -------------------------
+            # 参照した東京都オープンデータ
+            # -------------------------
             st.markdown("---")
             st.markdown("### 参照した東京都オープンデータ")
             for ref in references:
